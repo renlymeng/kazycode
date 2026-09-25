@@ -1,0 +1,255 @@
+// =============================================================================
+// GAME TOP-UP PLATFORM — DATABASE SCHEMA (PostgreSQL)
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// USERS & ADMIN (RBAC)
+// -----------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  SUPPORT
+  ADMIN
+  SUPER_ADMIN
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String?  @unique
+  telegramId    String?  @unique
+  googleId      String?  @unique
+  displayName   String?
+  role          Role     @default(CUSTOMER)
+
+  // Admin-only fields (MFA — TOTP, never SMS/email OTP)
+  mfaSecret     String?  // encrypted at rest (see CryptoService)
+  mfaEnabled    Boolean  @default(false)
+  passwordHash  String?  // only set for ADMIN/SUPER_ADMIN/SUPPORT (staff login)
+
+  isActive      Boolean  @default(true)
+  lastLoginAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  orders        Order[]
+  auditLogs     AuditLog[]
+
+  @@index([role])
+}
+
+// -----------------------------------------------------------------------------
+// GAMES & PACKAGES
+// -----------------------------------------------------------------------------
+
+model Game {
+  id              String   @id @default(uuid())
+  slug            String   @unique
+  nameEn          String
+  nameKh          String
+  iconUrl         String
+  bannerUrl       String?
+  region          String?  // e.g. KH, SG, TH, Global
+  publisherCode   String   // internal code used to route to publisher API adapter
+  isActive        Boolean  @default(true)   // <-- the ON/OFF toggle
+  isHot           Boolean  @default(false)
+  sortOrder       Int      @default(0)
+
+  // Nickname-validation API config for this publisher (adapter key + base url)
+  nicknameApiAdapter String  // maps to a registered adapter in NicknameValidationService
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  packages        GamePackage[]
+  orders          Order[]
+
+  @@index([isActive, sortOrder])
+}
+
+model GamePackage {
+  id          String   @id @default(uuid())
+  gameId      String
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  nameEn      String
+  nameKh      String
+  amount      Decimal  @db.Decimal(12, 2) // price
+  currency    String   @default("USD")
+  providerSku String   // SKU sent to fulfillment provider
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  orders      Order[]
+
+  @@index([gameId, isActive])
+}
+
+// -----------------------------------------------------------------------------
+// ORDERS
+// -----------------------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  DELIVERING
+  DELIVERED
+  FAILED
+  REFUNDED
+  EXPIRED
+}
+
+enum PaymentMethod {
+  ABA_KHQR
+  PAYWAY
+}
+
+model Order {
+  id              String        @id @default(uuid())
+  orderNo         String        @unique // human-readable, e.g. TOP-20260925-000123
+
+  userId          String?
+  user            User?         @relation(fields: [userId], references: [id])
+
+  gameId          String
+  game            Game          @relation(fields: [gameId], references: [id])
+
+  packageId       String
+  package         GamePackage   @relation(fields: [packageId], references: [id])
+
+  playerId        String        // in-game ID entered by the customer
+  playerServer    String?       // some games need a zone/server id
+  playerNickname  String        // fetched & confirmed before payment
+
+  amount          Decimal       @db.Decimal(12, 2)
+  currency        String        @default("USD")
+
+  paymentMethod   PaymentMethod?
+  status          OrderStatus   @default(PENDING_PAYMENT)
+
+  contactPhone    String?       // for guest order lookup, optional
+  ipAddress       String?
+  userAgent       String?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  paidAt          DateTime?
+  deliveredAt     DateTime?
+  expiresAt       DateTime      // payment window (e.g. now + 15 min)
+
+  payment         Payment?
+  deliveryAttempts DeliveryAttempt[]
+
+  @@index([status])
+  @@index([playerId])
+  @@index([createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// PAYMENTS
+// -----------------------------------------------------------------------------
+
+enum PaymentStatus {
+  INITIATED
+  AWAITING_WEBHOOK
+  VERIFIED
+  FAILED
+  DUPLICATE_IGNORED
+}
+
+model Payment {
+  id               String        @id @default(uuid())
+  orderId          String        @unique
+  order            Order         @relation(fields: [orderId], references: [id])
+
+  provider         PaymentMethod
+  providerTxnRef   String?       // reference returned by ABA/PayWay
+  qrString         String?       // KHQR payload shown to customer
+
+  // Idempotency: unique key derived from provider + provider's own transaction id.
+  // A webhook that repeats this key is a duplicate and MUST NOT re-credit the order.
+  idempotencyKey   String?       @unique
+
+  status           PaymentStatus @default(INITIATED)
+  rawWebhookPayload Json?
+  signatureValid   Boolean?
+
+  createdAt        DateTime      @default(now())
+  verifiedAt       DateTime?
+
+  @@index([provider, status])
+}
+
+// Every inbound webhook call is logged, verified or not, for forensic audit.
+model WebhookLog {
+  id              String   @id @default(uuid())
+  provider        PaymentMethod
+  headers         Json
+  rawBody         String
+  signatureValid  Boolean
+  idempotencyKey  String?
+  processedOk     Boolean  @default(false)
+  errorMessage    String?
+  receivedAt      DateTime @default(now())
+
+  @@index([provider, receivedAt])
+  @@index([idempotencyKey])
+}
+
+// -----------------------------------------------------------------------------
+// FULFILLMENT / DELIVERY QUEUE
+// -----------------------------------------------------------------------------
+
+enum DeliveryStatus {
+  QUEUED
+  PROCESSING
+  SUCCESS
+  RETRY_SCHEDULED
+  FAILED_PERMANENT
+}
+
+model DeliveryAttempt {
+  id          String         @id @default(uuid())
+  orderId     String
+  order       Order          @relation(fields: [orderId], references: [id])
+
+  attemptNo   Int
+  status      DeliveryStatus @default(QUEUED)
+  providerResponse Json?
+  errorMessage String?
+
+  createdAt   DateTime       @default(now())
+  finishedAt  DateTime?
+
+  @@index([orderId])
+}
+
+// -----------------------------------------------------------------------------
+// AUDIT LOG (admin actions — game toggle, refunds, MFA changes, etc.)
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  adminId    String
+  admin      User     @relation(fields: [adminId], references: [id])
+  action     String   // e.g. "GAME_TOGGLE_OFF", "ORDER_REFUND", "MFA_ENABLED"
+  targetType String   // "Game" | "Order" | "User"
+  targetId   String
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([targetType, targetId])
+}
